@@ -1,0 +1,708 @@
+#These codes cannot be regenrated by other users. This is just to show how the analysis of the paper was done.
+
+################################################# Tuning random forests ################################################# 
+
+#install.packages('easypackages')
+
+#library(easypackages)
+
+easypackages::packages('openxlsx','tidyverse','furrr','magrittr',
+                       
+                       'recipes','parallel','doParallel','caret','ranger',
+                       
+                       'DMwR','pdp','vip','ggsci','cowplot','scales')
+
+
+options(tibble.width=Inf)
+
+address <- 
+  
+  "C:\\Users\\narges\\Desktop\\1. HTN data - Raw (Tabular format).xlsx"
+
+data <- read.xlsx(address) %>% as_tibble
+
+data %<>% select(-c(1,6)) %>%
+  
+  mutate_if(~identical(unique(na.omit(.)) %>% sort,c(0,1)),
+            
+            ~as.factor(.) %>% fct_recode('No'='0','Yes'='1')) %>%
+  
+  mutate_if(is.character,as.factor) %>%
+  
+  mutate(YOS=fct_relevel(YOS,levels(YOS)[c(1,3,2)]),
+         
+         Wealth.Index=fct_relevel(Wealth.Index,
+                                  
+                                  levels(Wealth.Index)[c(5,2,3,1,4)]),
+         
+         Marital.Status=fct_relevel(Marital.Status,
+                                    
+                                    levels(Marital.Status)[4:1]),
+         
+         Insurance.Coverage=
+           
+           fct_relevel(Insurance.Coverage,
+                       
+                       levels(Insurance.Coverage)[c(3,4,2,1)]) %>%
+           
+           fct_collapse('Good coverage'=c('Weak coverage','Good Coverage')))
+
+
+data_list <- as.list(1:4) %>% map(~data[,c(.,5:length(data))])
+
+
+########################################################################
+
+cluster <- makeCluster(detectCores()-1)
+
+registerDoParallel(cluster)
+
+future::plan(multiprocess)
+
+
+f <- function(dat){
+  
+  resp <- names(dat)[1]
+  
+  bp <- recipe(str_c(resp,'~.') %>% as.formula,data=data) %>%
+    
+    step_zv(recipes::all_predictors()) %>%
+    
+    step_nzv(recipes::all_predictors()) %>%
+    
+    step_bagimpute(recipes::all_predictors())
+  
+  
+  cv_ranger <- seq(.25,1,.25) %>% as.list %>%
+    
+    future_map(~train(bp,method='ranger',data=data,
+                      
+                      trControl=trainControl(method='oob',
+                                             
+                                             number=50,
+                                             
+                                             sampling='smote',
+                                             
+                                             verboseIter=T,
+                                             
+                                             allowParallel=T),
+                      
+                      tuneGrid=expand.grid(mtry=c(2,6,10),
+                                           
+                                           min.node.size=c(1,5,10),
+                                           
+                                           splitrule='gini'),
+                      
+                      respect.unordered.factors='order',sample.fraction=.),
+               
+               scheduling=Inf)
+  
+  
+  cv_results <- map2(.x=cv_ranger %>% map(~.$results) %>% 
+                       
+                       map(~select(.,-splitrule)),
+                     
+                     .y=seq(.25,1,.25) %>% as.list,
+                     
+                     .f=~mutate(.x,sample.fraction=.y)) %>%
+    
+    reduce(rbind) %>% arrange(desc(Accuracy))
+  
+  
+  return(cv_results)
+  
+}
+
+reach_results <- data_list %>% future_map(~f(.),scheduling=Inf)
+
+names(reach_results) <- names(data)[1:4]
+
+write.xlsx(reach_results,file.choose())
+
+parallel::stopCluster(cluster)
+
+######################################### Importance + Partial dependence plots #########################################
+
+# best_ranger is the best obtained model for each step of cae from the tuning procedures
+
+vip(best_ranger,num_features=20,
+    
+    color='#374E55FF',fill='#374E55FF',
+    
+    #color='#00468BFF',fill='#00468BFF',
+    
+    width=.3) + theme_minimal() +
+  
+  labs(y='Importance (Permutation)') +
+  
+  theme(panel.grid=element_line(color='grey85'),
+        
+        text=element_text(family='serif')) -> imp_plot
+
+importance_plot <- imp_plot
+
+importance_plot$data$Variable %<>% str_replace_all('\\.',' ')
+
+importance_plot
+
+
+
+
+pred_wrapper <- function(object,newdata){
+  
+  colMeans(predict(object,data=newdata)$predictions)
+  
+}
+
+
+pdp_data <- imp_plot$data %>% 
+  
+  filter(Importance>quantile(Importance)[3]) %>% 
+  
+  .$Variable %>% as.list %>%
+  
+  map(~partial(best_ranger,pred.var=.,pred.fun=pred_wrapper) %>% 
+        
+        as.data.frame %>% as_tibble %>% 
+        
+        mutate(variable=names(.)[1]) %>%
+        
+        rename('value'=names(.)[1]) %>%
+        
+        mutate_at('yhat.id',~as.factor(.) %>% fct_inorder)) %>%
+  
+  reduce(rbind) %>% rename('Final stage'='yhat.id') %>%
+  
+  mutate_at('variable',~str_replace_all(.,'\\.',' ') %>% 
+              
+              as.factor %>% fct_inorder)
+
+
+pdp_plots <- 
+  
+  ggplot(data=pdp_data,aes(x=value,y=yhat,group=`Final stage`,
+                           
+                           color=`Final stage`)) +
+  
+  #geom_point(size=3) + geom_line(linetype='dashed') +
+  
+  geom_bar(aes(fill=`Final stage`),stat='identity',width=.5) +
+  
+  facet_wrap(~variable,scales='free_x') + theme_minimal() + 
+  
+  labs(x='',y='Mean of predicted probabilities') +
+  
+  theme(panel.grid = element_line(color='grey85'),
+        
+        panel.spacing.x = unit(.6,'cm'),
+        
+        axis.text = element_text(angle=90),
+        
+        text=element_text(family='serif')) + 
+  
+  #scale_color_lancet()
+  
+  scale_color_jama() + scale_fill_jama()
+
+
+plot_grid(importance_plot,pdp_plots,rel_widths=c(1,2))
+
+################################################## Interaction plots ##################################################
+
+
+easypackages::packages('openxlsx','tidyverse','furrr','magrittr',
+                       
+                       'recipes','parallel','doParallel','caret','ranger',
+                       
+                       'pdp','vip','ggsci','cowplot','scales')
+
+
+options(tibble.width=Inf)
+
+address <- 
+  
+  "C:\\Users\\Shawk\\Downloads\\Compressed\\HTN Care cascade\\1. HTN data - Raw (Tabular format).xlsx"
+
+data <- read.xlsx(address) %>% as_tibble
+
+data %<>% select(-c(1,6)) %>%
+  
+  mutate_if(~identical(unique(na.omit(.)) %>% sort,c(0,1)),
+            
+            ~as.factor(.) %>% fct_recode('No'='0','Yes'='1')) %>%
+  
+  mutate_if(is.character,as.factor) %>%
+  
+  mutate(YOS=fct_relevel(YOS,levels(YOS)[c(1,3,2)]),
+         
+         Wealth.Index=fct_relevel(Wealth.Index,
+                                  
+                                  levels(Wealth.Index)[c(5,2,3,1,4)]),
+         
+         Marital.Status=fct_relevel(Marital.Status,
+                                    
+                                    levels(Marital.Status)[4:1]),
+         
+         Insurance.Coverage=
+           
+           fct_relevel(Insurance.Coverage,
+                       
+                       levels(Insurance.Coverage)[c(3,4,2,1)]) %>%
+           
+           fct_collapse('Good coverage'=c('Weak coverage','Good Coverage')))
+
+
+data_list <- as.list(1:4) %>% map(~data[,c(.,5:length(data))])
+
+names(data_list) <- names(data[,1:4])
+
+
+pre_proc <- function(data){
+  
+  resp <- names(data)[1]
+  
+  bp <- recipe(str_c(resp,'~.') %>% as.formula,data=data) %>%
+    
+    step_zv(all_predictors()) %>%
+    
+    step_nzv(all_predictors()) %>%
+    
+    step_impute_bag(all_predictors(),trees=25)
+  
+  return(prep(bp,training=data) %>% juice)
+  
+}
+
+data_list <- data_list %>% map(pre_proc)
+
+
+###############################################################################
+
+
+interactions <- function(model){
+  
+  pred_wrapper <- function(object,newdata){
+    
+    colMeans(predict(object,data=newdata)$predictions)
+    
+  }
+  
+  return(
+    
+    list('age, sex, education, wealth'=
+           
+           partial(model,c('Age.Group','Sex','YOS','Wealth.Index'),
+                   
+                   pred.fun=pred_wrapper),
+         
+         'age, sex, marital stat, area'=
+           
+           partial(model,c('Age.Group','Sex','Marital.Status','Area'),
+                   
+                   pred.fun=pred_wrapper),
+         
+         'age, sex, marital stat, wealth'=
+           
+           partial(model,c('Age.Group','Sex','Marital.Status','Wealth.Index'),
+                   
+                   pred.fun=pred_wrapper),
+         
+         'age, sex, area'=
+           
+           partial(model,c('Age.Group','Sex','Area'),
+                   
+                   pred.fun=pred_wrapper),
+         
+         'area, education, wealth'=
+           
+           partial(model,c('Area','YOS','Wealth.Index'),
+                   
+                   pred.fun=pred_wrapper),
+         
+         'age, sex, bmi, diabetes'=
+           
+           partial(model,c('Age.Group','Sex','BMI','Diabetes'),
+                   
+                   pred.fun=pred_wrapper),
+         
+         'age, sex, bmi, smoking'=
+           
+           partial(model,c('Age.Group','Sex','BMI','Smoking'),
+                   
+                   pred.fun=pred_wrapper))
+    
+  )
+  
+}
+
+
+# Screening (mtry=6, min.node.size=5, sample.fraction=0.75)
+
+Screening_fit <- ranger(Screening~.,data=data_list$Screening,
+                        
+                        respect.unordered.factors='order',splitrule='gini',
+                        
+                        mtry=6,min.node.size=5,sample.fraction=.75,
+                        
+                        probability=T,num.trees=100)
+
+# Diagnosis (mtry=10, min.node.size=1, sample.fraction=1)
+
+Diagnosis_fit <- ranger(Diagnosis~.,data=data_list$Diagnosis,
+                        
+                        respect.unordered.factors='order',splitrule='gini',
+                        
+                        mtry=10,min.node.size=1,sample.fraction=1,
+                        
+                        probability=T,num.trees=100)
+
+# Treatment (mtry=10, min.node.size=1, sample.fraction=1)
+
+Treatment_fit <- ranger(Treatment~.,data=data_list$Treatment,
+                        
+                        respect.unordered.factors='order',splitrule='gini',
+                        
+                        mtry=10,min.node.size=1,sample.fraction=1,
+                        
+                        probability=T,num.trees=100)
+
+# Control (mtry=10, min.node.size=5, sample.fraction=0.25)
+
+Control_fit <- ranger(Control~.,data=data_list$Control,
+                      
+                      respect.unordered.factors='order',splitrule='gini',
+                      
+                      mtry=10,min.node.size=5,sample.fraction=.25,
+                      
+                      probability=T,num.trees=100)
+
+
+pd_values <- list('Screening'=Screening_fit,
+                  
+                  'Diagnosis'=Diagnosis_fit,
+                  
+                  'Treatment'=Treatment_fit,
+                  
+                  'Control'=Control_fit) %>% map(interactions)
+
+
+map2(.x=pd_values,
+     
+     .y=names(pd_values),
+     
+     .f=~write.xlsx(.x,str_c('C:\\Users\\Shawk\\Desktop\\HTN interactions (PD values)\\',.y,'.xlsx'),
+                    
+                    overwrite=T))
+
+###############################################################################
+
+pd_data <- read.xlsx(file.choose(),sheet=1) %>% as_tibble %>% 
+  
+  filter(yhat.id=='Yes') %>%
+  
+  mutate_at(names(.)[-which(names(.)=='yhat')],
+            
+            ~as.factor(.) %>% fct_inorder) %>%
+  
+  rename('Wealth index'='Wealth.Index','Education'='YOS') %>%
+  
+  mutate_at('Education',~as.factor(.) %>% fct_recode('Primary'='[0,5)',
+                                                     
+                                                     'Secondary'='[5,11)',
+                                                     
+                                                     'Academic'='[11,Inf)'))
+
+
+int1_create <- function(name){
+  
+  ggplot(data=pd_data) + 
+    
+    geom_point(aes(x=Age.Group,y=yhat,color=Sex),size=2.5) +
+    
+    geom_line(aes(x=Age.Group,y=yhat,color=Sex,group=Sex),
+              
+              linetype='dashed',size=.7) +
+    
+    facet_grid(Education~`Wealth index`,labeller = label_both) + theme_light() +
+    
+    labs(x='Age group',y=str_c('Probability of reaching ',name),
+         
+         title='Interaction between: Age group, Sex, Education & Wealth index') +
+    
+    theme(axis.text.x = element_text(angle=90),
+          
+          legend.title = element_text(face='bold',color='grey20'),
+          
+          axis.title = element_text(face='bold',color='grey20'),
+          
+          strip.text = element_text(face='bold'),
+          
+          title = element_text(face='bold',color='grey20'))
+  
+  
+}
+
+
+
+
+pd_data <- read.xlsx(file.choose(),sheet=2) %>% as_tibble %>% 
+  
+  filter(yhat.id=='Yes') %>%
+  
+  mutate_at(names(.)[-which(names(.)=='yhat')],
+            
+            ~as.factor(.) %>% fct_inorder) %>%
+  
+  rename('Marital status'='Marital.Status','Age group'='Age.Group')
+
+
+int2_create <- function(name){
+  
+  ggplot(data=pd_data) + 
+    
+    geom_point(aes(x=`Marital status`,y=yhat,color=Sex),size=2.5) +
+    
+    geom_line(aes(x=`Marital status`,y=yhat,color=Sex,group=Sex),
+              
+              linetype='dashed',size=.7) +
+    
+    facet_grid(Area~`Age group`,labeller = label_both) + theme_light() +
+    
+    labs(x='Age group',y=str_c('Probability of reaching ',name),
+         
+         title='Interaction between: Age group, Sex, Area of living & Marital status') +
+    
+    theme(axis.text.x = element_text(angle=90),
+          
+          legend.title = element_text(face='bold',color='grey20'),
+          
+          axis.title = element_text(face='bold',color='grey20'),
+          
+          strip.text = element_text(face='bold'),
+          
+          title = element_text(face='bold',color='grey20'))
+  
+  
+}
+
+int2_create('control')
+
+
+
+pd_data <- read.xlsx(file.choose(),sheet=3) %>% as_tibble %>% 
+  
+  filter(yhat.id=='Yes') %>%
+  
+  mutate_at(names(.)[-which(names(.)=='yhat')],
+            
+            ~as.factor(.) %>% fct_inorder) %>%
+  
+  rename('Marital status'='Marital.Status',
+         
+         'Wealth index'='Wealth.Index')
+
+
+int3_create <- function(name){
+  
+  ggplot(data=pd_data) + 
+    
+    geom_point(aes(x=Age.Group,y=yhat,color=Sex),size=2.5) +
+    
+    geom_line(aes(x=Age.Group,y=yhat,color=Sex,group=Sex),
+              
+              linetype='dashed',size=.7) +
+    
+    facet_grid(`Marital status`~`Wealth index`,labeller = label_both) + theme_light() +
+    
+    labs(x='Age group',y=str_c('Probability of reaching ',name),
+         
+         title='Interaction between: Age group, Sex, Marital status & Wealth index') +
+    
+    theme(axis.text.x = element_text(angle=90),
+          
+          legend.title = element_text(face='bold',color='grey20'),
+          
+          axis.title = element_text(face='bold',color='grey20'),
+          
+          strip.text = element_text(face='bold'),
+          
+          title = element_text(face='bold',color='grey20'))
+  
+  
+}
+
+
+
+pd_data <- read.xlsx(file.choose(),sheet=4) %>% as_tibble %>% 
+  
+  filter(yhat.id=='Yes') %>%
+  
+  mutate_at(names(.)[-which(names(.)=='yhat')],
+            
+            ~as.factor(.) %>% fct_inorder)
+
+
+int4_create <- function(name){
+  
+  ggplot(data=pd_data) + 
+    
+    geom_point(aes(x=Age.Group,y=yhat,color=Sex),size=2.5) +
+    
+    geom_line(aes(x=Age.Group,y=yhat,color=Sex,group=Sex),
+              
+              linetype='dashed',size=.7) +
+    
+    facet_grid(~Area,labeller = label_both) + theme_light() +
+    
+    labs(x='Age group',y=str_c('Probability of reaching ',name),
+         
+         title='Interaction between: Age group, Sex & Area of living') +
+    
+    theme(axis.text.x = element_text(angle=90),
+          
+          legend.title = element_text(face='bold',color='grey20'),
+          
+          axis.title = element_text(face='bold',color='grey20'),
+          
+          strip.text = element_text(face='bold'),
+          
+          title = element_text(face='bold',color='grey20'))
+  
+  
+}
+
+
+
+
+pd_data <- read.xlsx(file.choose(),sheet=5) %>% as_tibble %>% 
+  
+  filter(yhat.id=='Yes') %>%
+  
+  mutate_at(names(.)[-which(names(.)=='yhat')],
+            
+            ~as.factor(.) %>% fct_inorder) %>%
+  
+  rename('Wealth index'='Wealth.Index','Education'='YOS') %>%
+  
+  mutate_at('Education',~as.factor(.) %>% fct_recode('Primary'='[0,5)',
+                                                     
+                                                     'Secondary'='[5,11)',
+                                                     
+                                                     'Academic'='[11,Inf)'))
+
+
+int5_create <- function(name){
+  
+  ggplot(data=pd_data) + 
+    
+    geom_point(aes(x=`Wealth index`,y=yhat,color=Area),size=2.5) +
+    
+    geom_line(aes(x=`Wealth index`,y=yhat,color=Area,group=Area),
+              
+              linetype='dashed',size=.7) +
+    
+    facet_grid(~Education,labeller = label_both) + theme_light() +
+    
+    labs(x='Wealth index',y=str_c('Probability of reaching ',name),
+         
+         title='Interaction between: Area of living, Education & Wealth index') +
+    
+    theme(axis.text.x = element_text(angle=90),
+          
+          legend.title = element_text(face='bold',color='grey20'),
+          
+          axis.title = element_text(face='bold',color='grey20'),
+          
+          strip.text = element_text(face='bold'),
+          
+          title = element_text(face='bold',color='grey20'))
+  
+  
+}
+
+int5_create('control')
+
+
+
+pd_data <- read.xlsx(file.choose(),sheet=6) %>% as_tibble %>% 
+  
+  filter(yhat.id=='Yes') %>%
+  
+  mutate_at(names(.)[-which(names(.)=='yhat')],
+            
+            ~as.factor(.) %>% fct_inorder) %>%
+  
+  rename('Age group'='Age.Group')
+
+
+int6_create <- function(name){
+  
+  ggplot(data=pd_data) + 
+    
+    geom_point(aes(x=`Age group`,y=yhat,color=Sex),size=2.5) +
+    
+    geom_line(aes(x=`Age group`,y=yhat,color=Sex,group=Sex),
+              
+              linetype='dashed',size=.7) +
+    
+    facet_grid(Diabetes~BMI,labeller = label_both) + theme_light() +
+    
+    labs(x='Wealth index',y=str_c('Probability of reaching ',name),
+         
+         title='Interaction between: Age group, Sex, BMI & Diabetes') +
+    
+    theme(axis.text.x = element_text(angle=90),
+          
+          legend.title = element_text(face='bold',color='grey20'),
+          
+          axis.title = element_text(face='bold',color='grey20'),
+          
+          strip.text = element_text(face='bold'),
+          
+          title = element_text(face='bold',color='grey20'))
+  
+  
+}
+
+
+
+
+pd_data <- read.xlsx(file.choose(),sheet=7) %>% as_tibble %>% 
+  
+  filter(yhat.id=='Yes') %>%
+  
+  mutate_at(names(.)[-which(names(.)=='yhat')],
+            
+            ~as.factor(.) %>% fct_inorder) %>%
+  
+  rename('Age group'='Age.Group')
+
+
+int7_create <- function(name){
+  
+  ggplot(data=pd_data) + 
+    
+    geom_point(aes(x=`Age group`,y=yhat,color=Sex),size=2.5) +
+    
+    geom_line(aes(x=`Age group`,y=yhat,color=Sex,group=Sex),
+              
+              linetype='dashed',size=.7) +
+    
+    facet_grid(Smoking~BMI,labeller = label_both) + theme_light() +
+    
+    labs(x='Wealth index',y=str_c('Probability of reaching ',name),
+         
+         title='Interaction between: Age group, Sex, BMI & Smoking') +
+    
+    theme(axis.text.x = element_text(angle=90),
+          
+          legend.title = element_text(face='bold',color='grey20'),
+          
+          axis.title = element_text(face='bold',color='grey20'),
+          
+          strip.text = element_text(face='bold'),
+          
+          title = element_text(face='bold',color='grey20'))
+  
+  
+}
